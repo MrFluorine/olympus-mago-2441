@@ -180,3 +180,24 @@ Tests call no new Rust symbol. They use the pre-existing `framework::TestCase` a
 
 ### Deliverables changed this turn
 `Description.md`, `metadata.md`, `Dockerfile`, `test.patch` (created); `solution.patch` (regenerated, content unchanged apart from excluding test files).
+
+## Turn 6 - 2026-11-14 - container verification and audit
+
+- Image `mago-pcre:verify` built from the pinned tree on `olympus-base-rust:latest` (9.97 GB, 714 s build).
+- 2x2 inside the image as uid 1000 with `--network none`, patches applied with `git apply`:
+  test.patch only -> base 3396/0 failures (exit 0), new 31/31 failures (exit 101);
+  + solution.patch -> base 3396/0 (exit 0), new 31/0 (exit 0). All four JUnit files pass `xmllint --noout`.
+- File audit passed: description 127 words ASCII, no links; test.patch has two files, `test.sh` mode 100755,
+  no platform names; solution.patch has no test files; Dockerfile has base image, `/app`, `COPY . .`, `CMD`.
+- `metadata.md` gained a License line (Apache-2.0) at the user's request.
+- Workspace pushed to private repo MrFluorine/olympus-mago-2441 (no co-author trailer, at the user's request).
+
+### Open risks (not fixed)
+- `test.sh` uses cargo's `--no-fail-fast`; a naive "no fail-fast flags" check could misread it.
+- Dockerfile line `cargo build ... --tests` only compiles, but contains the word "tests".
+- Image is ~10 GB; Dockerfile installs Rust 1.100 over the base image's 1.95 (justified inline).
+- 127-word description relies on "mirrors PHP at runtime"; Test Quality may call some tests under-specified.
+- Not run: flake repeats, CPU-saturation run, any platform check, any agent rollout.
+
+### Deliverables changed this turn
+`metadata.md`.
