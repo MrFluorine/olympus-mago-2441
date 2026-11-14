@@ -3,3 +3,4 @@
 - **Commit hash**: 546772c58b13d4e8f4e188939d9cb794d39d1f9e
 - **Issue category**: enhancement
 - **Language**: Rust
+- **License**: Apache-2.0
