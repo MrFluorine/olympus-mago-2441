@@ -1,0 +1,5 @@
+- **Title**: Infer preg_match_all() matches from the capturing groups of a literal pattern
+- **GitHub repository link**: https://github.com/carthage-software/mago
+- **Commit hash**: 546772c58b13d4e8f4e188939d9cb794d39d1f9e
+- **Issue category**: enhancement
+- **Language**: Rust

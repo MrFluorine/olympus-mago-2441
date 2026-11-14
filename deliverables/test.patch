@@ -1,0 +1,783 @@
+diff --git a/crates/analyzer/tests/preg_match_all_matches.rs b/crates/analyzer/tests/preg_match_all_matches.rs
+new file mode 100644
+index 00000000..4e823ba4
+--- /dev/null
++++ b/crates/analyzer/tests/preg_match_all_matches.rs
+@@ -0,0 +1,686 @@
++#[allow(dead_code)]
++mod framework;
++
++use crate::framework::TestCase;
++
++const HELPERS: &str = r"<?php
++
++declare(strict_types=1);
++
++function takes_string(string $_): void {}
++
++/** @param non-empty-string $_ */
++function takes_non_empty_string(string $_): void {}
++
++function takes_int(int $_): void {}
++
++/** @param non-empty-list<mixed> $_ */
++function takes_non_empty_list(array $_): void {}
++";
++
++fn run(name: &str, body: &str) {
++    let content = format!("{HELPERS}\n{body}");
++
++    TestCase::new(name, content.as_bytes()).run();
++}
++
++#[test]
++fn preg_match_all_matches_named_groups_are_keyed_by_name_and_number() {
++    run(
++        "preg_match_all_matches_named_groups_are_keyed_by_name_and_number",
++        r"
++function check(string $subject): void
++{
++    $matches = [];
++    preg_match_all('/(?<slot>\{\{(?<slotname>\w+)\}\})/', $subject, $matches);
++
++    foreach ($matches['slot'] as $slot) {
++        takes_string($slot);
++    }
++
++    foreach ($matches['slotname'] as $name) {
++        takes_string($name);
++    }
++
++    foreach ([$matches[0], $matches[1], $matches[2]] as $captures) {
++        foreach ($captures as $capture) {
++            takes_string($capture);
++        }
++    }
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_keys_outside_the_pattern_are_undefined() {
++    run(
++        "preg_match_all_matches_keys_outside_the_pattern_are_undefined",
++        r"
++function check(string $subject): void
++{
++    $matches = [];
++    preg_match_all('/(?<word>\w+)/', $subject, $matches);
++
++    $known = $matches['word'];
++    // @mago-expect analysis:undefined-string-array-index
++    $unknown = $matches['other'];
++    // @mago-expect analysis:undefined-int-array-index
++    $beyond = $matches[2];
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_three_named_group_syntaxes_are_recognized() {
++    run(
++        "preg_match_all_matches_three_named_group_syntaxes_are_recognized",
++        r"
++function check(string $subject): void
++{
++    $matches = [];
++    preg_match_all('/(?<first>a)(?P<second>b)(?\'third\'c)/', $subject, $matches);
++
++    $first = $matches['first'];
++    $second = $matches['second'];
++    $third = $matches['third'];
++    // @mago-expect analysis:undefined-int-array-index
++    $beyond = $matches[4];
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_non_capturing_constructs_are_not_numbered() {
++    run(
++        "preg_match_all_matches_non_capturing_constructs_are_not_numbered",
++        r"
++function check(string $subject): void
++{
++    $matches = [];
++    preg_match_all('/(?:a)(?=b)(?>c)(?#note)(d)[(](e)\((f)\Q(\E/', $subject, $matches);
++
++    $last = $matches[3];
++    // @mago-expect analysis:undefined-int-array-index
++    $beyond = $matches[4];
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_extended_modifier_ignores_comments() {
++    run(
++        "preg_match_all_matches_extended_modifier_ignores_comments",
++        "
++function check(string $subject): void
++{
++    $matches = [];
++    preg_match_all(\"/(a) # (not a group)\\n (b)/x\", $subject, $matches);
++
++    $last = $matches[2];
++    // @mago-expect analysis:undefined-int-array-index
++    $beyond = $matches[3];
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_inline_extended_option_ignores_comments() {
++    run(
++        "preg_match_all_matches_inline_extended_option_ignores_comments",
++        "
++function check(string $subject): void
++{
++    $matches = [];
++    preg_match_all(\"/(?x) (a) # (not a group)\\n (b)/\", $subject, $matches);
++
++    $last = $matches[2];
++    // @mago-expect analysis:undefined-int-array-index
++    $beyond = $matches[3];
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_no_auto_capture_modifier_keeps_named_groups_only() {
++    run(
++        "preg_match_all_matches_no_auto_capture_modifier_keeps_named_groups_only",
++        r"
++function check(string $subject): void
++{
++    $matches = [];
++    preg_match_all('/(a)(?<kept>b)(c)/n', $subject, $matches);
++
++    $named = $matches['kept'];
++    $numbered = $matches[1];
++    // @mago-expect analysis:undefined-int-array-index
++    $beyond = $matches[2];
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_inline_no_auto_capture_option_keeps_named_groups_only() {
++    run(
++        "preg_match_all_matches_inline_no_auto_capture_option_keeps_named_groups_only",
++        r"
++function check(string $subject): void
++{
++    $matches = [];
++    preg_match_all('/(a)(?n)(b)(?<kept>c)/', $subject, $matches);
++
++    $named = $matches['kept'];
++    $numbered = $matches[2];
++    // @mago-expect analysis:undefined-int-array-index
++    $beyond = $matches[3];
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_branch_reset_alternatives_share_numbers() {
++    run(
++        "preg_match_all_matches_branch_reset_alternatives_share_numbers",
++        r"
++function check(string $subject): void
++{
++    $matches = [];
++    preg_match_all('/(?|(a)|(b)(c))(d)/', $subject, $matches);
++
++    $last = $matches[3];
++    // @mago-expect analysis:undefined-int-array-index
++    $beyond = $matches[4];
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_captures_are_non_empty_when_the_group_cannot_be_empty() {
++    run(
++        "preg_match_all_matches_captures_are_non_empty_when_the_group_cannot_be_empty",
++        r"
++function check(string $subject): void
++{
++    $matches = [];
++    preg_match_all('/(a+)(b*)/', $subject, $matches);
++
++    foreach ($matches[1] as $capture) {
++        takes_non_empty_string($capture);
++    }
++
++    foreach ($matches[2] as $capture) {
++        // @mago-expect analysis:possibly-invalid-argument
++        takes_non_empty_string($capture);
++    }
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_whole_match_is_non_empty_when_the_pattern_cannot_be_empty() {
++    run(
++        "preg_match_all_matches_whole_match_is_non_empty_when_the_pattern_cannot_be_empty",
++        r"
++function check(string $subject): void
++{
++    $words = [];
++    preg_match_all('/\w+/', $subject, $words);
++    foreach ($words[0] as $word) {
++        takes_non_empty_string($word);
++    }
++
++    $runs = [];
++    preg_match_all('/\w*/', $subject, $runs);
++    foreach ($runs[0] as $run) {
++        // @mago-expect analysis:possibly-invalid-argument
++        takes_non_empty_string($run);
++    }
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_optional_group_captures_may_be_empty() {
++    run(
++        "preg_match_all_matches_optional_group_captures_may_be_empty",
++        r"
++function check(string $subject): void
++{
++    $matches = [];
++    preg_match_all('/(a)(b)?/', $subject, $matches);
++
++    foreach ($matches[1] as $capture) {
++        takes_non_empty_string($capture);
++    }
++
++    foreach ($matches[2] as $capture) {
++        // @mago-expect analysis:possibly-invalid-argument
++        takes_non_empty_string($capture);
++    }
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_group_inside_optional_group_may_be_empty() {
++    run(
++        "preg_match_all_matches_group_inside_optional_group_may_be_empty",
++        r"
++function check(string $subject): void
++{
++    $matches = [];
++    preg_match_all('/(a)(?:x(b))*/', $subject, $matches);
++
++    foreach ($matches[1] as $capture) {
++        takes_non_empty_string($capture);
++    }
++
++    foreach ($matches[2] as $capture) {
++        // @mago-expect analysis:possibly-invalid-argument
++        takes_non_empty_string($capture);
++    }
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_alternative_captures_may_be_empty() {
++    run(
++        "preg_match_all_matches_alternative_captures_may_be_empty",
++        r"
++function check(string $subject): void
++{
++    $matches = [];
++    preg_match_all('/(x)(?:(a)|(b))/', $subject, $matches);
++
++    foreach ($matches[1] as $capture) {
++        takes_non_empty_string($capture);
++    }
++
++    foreach ($matches[2] as $capture) {
++        // @mago-expect analysis:possibly-invalid-argument
++        takes_non_empty_string($capture);
++    }
++
++    foreach ($matches[3] as $capture) {
++        // @mago-expect analysis:possibly-invalid-argument
++        takes_non_empty_string($capture);
++    }
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_branch_reset_group_in_every_alternative_always_takes_part() {
++    run(
++        "preg_match_all_matches_branch_reset_group_in_every_alternative_always_takes_part",
++        r"
++function check(string $subject): void
++{
++    $matches = [];
++    preg_match_all('/(?|(a)|(b)(c))/', $subject, $matches);
++
++    foreach ($matches[1] as $capture) {
++        takes_non_empty_string($capture);
++    }
++
++    foreach ($matches[2] as $capture) {
++        // @mago-expect analysis:possibly-invalid-argument
++        takes_non_empty_string($capture);
++    }
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_lookahead_group_takes_part_unless_negative() {
++    run(
++        "preg_match_all_matches_lookahead_group_takes_part_unless_negative",
++        r"
++function check(string $subject): void
++{
++    $positive = [];
++    preg_match_all('/(?=(a))a/', $subject, $positive);
++    foreach ($positive[1] as $capture) {
++        takes_non_empty_string($capture);
++    }
++
++    $negative = [];
++    preg_match_all('/(?!(z))a/', $subject, $negative);
++    foreach ($negative[1] as $capture) {
++        // @mago-expect analysis:possibly-invalid-argument
++        takes_non_empty_string($capture);
++    }
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_unmatched_as_null_makes_optional_captures_nullable() {
++    run(
++        "preg_match_all_matches_unmatched_as_null_makes_optional_captures_nullable",
++        r"
++function check(string $subject): void
++{
++    $matches = [];
++    preg_match_all('/(a)(b)?/', $subject, $matches, PREG_UNMATCHED_AS_NULL);
++
++    foreach ($matches[1] as $capture) {
++        takes_non_empty_string($capture);
++    }
++
++    foreach ($matches[2] as $capture) {
++        // @mago-expect analysis:possibly-null-argument
++        takes_string($capture);
++    }
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_offset_capture_pairs_captures_with_offsets() {
++    run(
++        "preg_match_all_matches_offset_capture_pairs_captures_with_offsets",
++        r"
++function check(string $subject): void
++{
++    $matches = [];
++    preg_match_all('/(a)/', $subject, $matches, PREG_OFFSET_CAPTURE);
++
++    foreach ($matches[1] as [$text, $offset]) {
++        takes_non_empty_string($text);
++        takes_int($offset);
++        // @mago-expect analysis:invalid-argument
++        takes_int($text);
++    }
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_set_order_lists_one_array_per_match() {
++    run(
++        "preg_match_all_matches_set_order_lists_one_array_per_match",
++        r"
++function check(string $subject): void
++{
++    $matches = [];
++    preg_match_all('/(a)(?<second>b)/', $subject, $matches, PREG_SET_ORDER);
++
++    foreach ($matches as $match) {
++        takes_non_empty_string($match[0]);
++        takes_non_empty_string($match[1]);
++        takes_non_empty_string($match['second']);
++        takes_non_empty_string($match[2]);
++        // @mago-expect analysis:undefined-int-array-index
++        $beyond = $match[3];
++    }
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_set_order_trailing_optional_group_may_be_missing() {
++    run(
++        "preg_match_all_matches_set_order_trailing_optional_group_may_be_missing",
++        r"
++function check(string $subject): void
++{
++    $matches = [];
++    preg_match_all('/(a)(?<tail>b)?/', $subject, $matches, PREG_SET_ORDER);
++
++    foreach ($matches as $match) {
++        takes_non_empty_string($match[1]);
++        // @mago-expect analysis:possibly-undefined-int-array-index
++        $number = $match[2];
++        // @mago-expect analysis:possibly-undefined-string-array-index
++        $name = $match['tail'];
++    }
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_set_order_optional_group_before_required_group_is_present() {
++    run(
++        "preg_match_all_matches_set_order_optional_group_before_required_group_is_present",
++        r"
++function check(string $subject): void
++{
++    $matches = [];
++    preg_match_all('/(a)?(b)/', $subject, $matches, PREG_SET_ORDER);
++
++    foreach ($matches as $match) {
++        takes_string($match[1]);
++        // @mago-expect analysis:possibly-invalid-argument
++        takes_non_empty_string($match[1]);
++        takes_non_empty_string($match[2]);
++    }
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_set_order_groups_after_last_required_group_may_be_missing() {
++    run(
++        "preg_match_all_matches_set_order_groups_after_last_required_group_may_be_missing",
++        r"
++function check(string $subject): void
++{
++    $matches = [];
++    preg_match_all('/(a)?(b)(c)*(d){0,2}/', $subject, $matches, PREG_SET_ORDER);
++
++    foreach ($matches as $match) {
++        takes_string($match[1]);
++        takes_non_empty_string($match[2]);
++        // @mago-expect analysis:possibly-undefined-int-array-index
++        $third = $match[3];
++        // @mago-expect analysis:possibly-undefined-int-array-index
++        $fourth = $match[4];
++    }
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_set_order_unmatched_as_null_keeps_every_group() {
++    run(
++        "preg_match_all_matches_set_order_unmatched_as_null_keeps_every_group",
++        r"
++function check(string $subject): void
++{
++    $matches = [];
++    preg_match_all('/(a)(b)?/', $subject, $matches, PREG_SET_ORDER | PREG_UNMATCHED_AS_NULL);
++
++    foreach ($matches as $match) {
++        takes_non_empty_string($match[1]);
++        // @mago-expect analysis:possibly-null-argument
++        takes_string($match[2]);
++    }
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_set_order_offset_capture_pairs_captures_with_offsets() {
++    run(
++        "preg_match_all_matches_set_order_offset_capture_pairs_captures_with_offsets",
++        r"
++function check(string $subject): void
++{
++    $matches = [];
++    preg_match_all('/(a)/', $subject, $matches, PREG_SET_ORDER | PREG_OFFSET_CAPTURE);
++
++    foreach ($matches as $match) {
++        [$text, $offset] = $match[1];
++        takes_non_empty_string($text);
++        takes_int($offset);
++        // @mago-expect analysis:invalid-argument
++        takes_int($text);
++    }
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_capture_lists_are_non_empty_when_the_call_matched() {
++    run(
++        "preg_match_all_matches_capture_lists_are_non_empty_when_the_call_matched",
++        r"
++function check(string $subject): void
++{
++    $matches = [];
++    if (preg_match_all('/(?<word>\w+)/', $subject, $matches)) {
++        takes_non_empty_list($matches[0]);
++        takes_non_empty_list($matches['word']);
++    }
++
++    // @mago-expect analysis:possibly-invalid-argument
++    takes_non_empty_list($matches['word']);
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_set_order_list_is_non_empty_when_the_call_matched() {
++    run(
++        "preg_match_all_matches_set_order_list_is_non_empty_when_the_call_matched",
++        r"
++function check(string $subject): void
++{
++    $matches = [];
++    if (preg_match_all('/(?<word>\w+)/', $subject, $matches, PREG_SET_ORDER)) {
++        takes_non_empty_list($matches);
++        takes_non_empty_string($matches[0]['word']);
++    }
++
++    // @mago-expect analysis:possibly-invalid-argument
++    takes_non_empty_list($matches);
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_non_literal_pattern_keeps_declared_type() {
++    run(
++        "preg_match_all_matches_non_literal_pattern_keeps_declared_type",
++        r"
++function check(string $subject, string $pattern): void
++{
++    $literal = [];
++    preg_match_all('/(?<word>\w+)/', $subject, $literal);
++    $known = $literal['word'];
++
++    $dynamic = [];
++    preg_match_all($pattern, $subject, $dynamic);
++    // @mago-expect analysis:mismatched-array-index
++    $unknown = $dynamic['word'];
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_non_literal_flags_keep_declared_type() {
++    run(
++        "preg_match_all_matches_non_literal_flags_keep_declared_type",
++        r"
++function check(string $subject, int $flags): void
++{
++    $literal = [];
++    preg_match_all('/(?<word>\w+)/', $subject, $literal, PREG_PATTERN_ORDER);
++    $known = $literal['word'];
++
++    $dynamic = [];
++    preg_match_all('/(?<word>\w+)/', $subject, $dynamic, $flags);
++    // @mago-expect analysis:mismatched-array-index
++    $unknown = $dynamic['word'];
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_conflicting_order_flags_keep_declared_type() {
++    run(
++        "preg_match_all_matches_conflicting_order_flags_keep_declared_type",
++        r"
++function check(string $subject): void
++{
++    $literal = [];
++    preg_match_all('/(?<word>\w+)/', $subject, $literal);
++    $known = $literal['word'];
++
++    $conflicting = [];
++    preg_match_all('/(?<word>\w+)/', $subject, $conflicting, PREG_PATTERN_ORDER | PREG_SET_ORDER);
++    // @mago-expect analysis:mismatched-array-index
++    $unknown = $conflicting['word'];
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_unbalanced_pattern_keeps_declared_type() {
++    run(
++        "preg_match_all_matches_unbalanced_pattern_keeps_declared_type",
++        r"
++function check(string $subject): void
++{
++    $literal = [];
++    preg_match_all('/(?<word>\w+)/', $subject, $literal);
++    $known = $literal['word'];
++
++    $unbalanced = [];
++    preg_match_all('/(?<word>\w+/', $subject, $unbalanced);
++    // @mago-expect analysis:mismatched-array-index
++    $unknown = $unbalanced['word'];
++}
++",
++    );
++}
++
++#[test]
++fn preg_match_all_matches_reused_group_name_keeps_declared_type() {
++    run(
++        "preg_match_all_matches_reused_group_name_keeps_declared_type",
++        r"
++function check(string $subject): void
++{
++    $literal = [];
++    preg_match_all('/(?<word>\w+)/', $subject, $literal);
++    $known = $literal['word'];
++
++    $reused = [];
++    preg_match_all('/(?J)(?<word>a)|(?<word>b)/', $subject, $reused);
++    // @mago-expect analysis:mismatched-array-index
++    $unknown = $reused['word'];
++}
++",
++    );
++}
+diff --git a/test.sh b/test.sh
+new file mode 100755
+index 00000000..6de39d42
+--- /dev/null
++++ b/test.sh
+@@ -0,0 +1,85 @@
++#!/usr/bin/env bash
++set -uo pipefail
++cd "$(dirname "$0")"
++
++MODE=""
++OUTPUT_PATH=""
++while [ $# -gt 0 ]; do
++  case "$1" in
++    --output_path) OUTPUT_PATH="${2:-}"; shift 2 ;;
++    --output_path=*) OUTPUT_PATH="${1#*=}"; shift ;;
++    base|new) MODE="$1"; shift ;;
++    *) shift ;;
++  esac
++done
++
++if [ -z "$MODE" ] || [ -z "$OUTPUT_PATH" ]; then
++  echo "usage: test.sh --output_path <file> base|new" >&2
++  exit 2
++fi
++
++mkdir -p "$(dirname "$OUTPUT_PATH")"
++
++export CARGO_TERM_COLOR=never NO_COLOR=1 TZ=UTC LC_ALL=C RUST_BACKTRACE=0
++
++case "$MODE" in
++  base) TARGETS=(--lib --test mod --test external_throw_type_providers --test unhandled_thrown_type_order) ;;
++  new) TARGETS=(--test preg_match_all_matches) ;;
++esac
++
++RAW_LOG="$(mktemp)"
++LOG="$(mktemp)"
++trap 'rm -f "$RAW_LOG" "$LOG"' EXIT
++
++cargo test --offline --locked --no-fail-fast -p mago-analyzer "${TARGETS[@]}" >"$RAW_LOG" 2>&1
++status=$?
++
++# Failure output can carry bytes that are not legal in XML 1.0.
++tr -d '\000-\010\013\014\016-\037' <"$RAW_LOG" >"$LOG"
++cat "$LOG"
++
++awk -v status="$status" '
++  function escape(text) {
++    gsub(/&/, "\\&amp;", text); gsub(/</, "\\&lt;", text); gsub(/>/, "\\&gt;", text); gsub(/"/, "\\&quot;", text)
++    return text
++  }
++  /^ +Running / {
++    suite = $2
++    if (suite == "unittests") suite = $3
++    next
++  }
++  /^---- .* stdout ----$/ {
++    capturing = substr($0, 6, length($0) - 17)
++    next
++  }
++  /^failures:$/ || /^test result: / { capturing = "" }
++  capturing != "" { output[capturing] = output[capturing] $0 "\n"; next }
++  /^test .* \.\.\. (ok|FAILED|ignored)$/ {
++    name = $0
++    sub(/^test /, "", name)
++    result = name
++    sub(/^.* \.\.\. /, "", result)
++    sub(/ \.\.\. (ok|FAILED|ignored)$/, "", name)
++    count++
++    names[count] = name; suites[count] = suite; results[count] = result
++    if (result == "FAILED") failures++
++    if (result == "ignored") skipped++
++  }
++  END {
++    harness = (count == 0 || (status != 0 && failures == 0)) ? 1 : 0
++    print "<?xml version=\"1.0\" encoding=\"UTF-8\"?>"
++    printf "<testsuites>\n<testsuite name=\"mago-analyzer\" tests=\"%d\" failures=\"%d\" skipped=\"%d\">\n", count + harness, failures + harness, skipped
++    for (i = 1; i <= count; i++) {
++      printf "<testcase classname=\"%s\" name=\"%s\">", escape(suites[i]), escape(names[i])
++      if (results[i] == "FAILED") printf "<failure message=\"test failed\">%s</failure>", escape(output[names[i]])
++      if (results[i] == "ignored") printf "<skipped/>"
++      print "</testcase>"
++    }
++    if (harness) {
++      print "<testcase classname=\"harness\" name=\"cargo_test\"><failure message=\"cargo test did not report its tests\">exit status " status "</failure></testcase>"
++    }
++    print "</testsuite>\n</testsuites>"
++  }
++' "$LOG" >"$OUTPUT_PATH"
++
++exit "$status"

@@ -1,0 +1,1025 @@
+diff --git a/crates/analyzer/src/external/protocol.rs b/crates/analyzer/src/external/protocol.rs
+index daddfdde..a9de8f09 100644
+--- a/crates/analyzer/src/external/protocol.rs
++++ b/crates/analyzer/src/external/protocol.rs
+@@ -2324,7 +2324,12 @@ where
+     let if_false = decode_assertion_map(&mut reader, &request_type)?;
+     reader.finish()?;
+ 
+-    let assertions = crate::plugin::provider::assertion::InvocationAssertions { type_assertions, if_true, if_false };
++    let assertions = crate::plugin::provider::assertion::InvocationAssertions {
++        type_assertions,
++        if_true,
++        if_false,
++        out_types: std::collections::BTreeMap::new(),
++    };
+     if assertions.is_empty() {
+         return Err(protocol("handled assertion provider response contains no assertions"));
+     }
+diff --git a/crates/analyzer/src/invocation/post_process.rs b/crates/analyzer/src/invocation/post_process.rs
+index 42baa2d3..a1357003 100644
+--- a/crates/analyzer/src/invocation/post_process.rs
++++ b/crates/analyzer/src/invocation/post_process.rs
+@@ -1774,6 +1774,32 @@ where
+         return Ok(());
+     };
+ 
++    for (parameter, out_type) in &assertions.out_types {
++        let (Some(argument), Some(variable)) =
++            resolve_argument_or_special_target(context, block_context, invocation, *parameter, this_variable)
++        else {
++            continue;
++        };
++
++        let mut out_type = out_type.clone();
++        out_type.set_by_reference(true);
++
++        let out_type = Rc::new(out_type);
++        assign_to_expression(
++            context,
++            block_context,
++            artifacts,
++            argument,
++            Some(variable),
++            Some(argument),
++            Rc::clone(&out_type),
++            false,
++            PropertyWriteKind::Mutation,
++        )?;
++
++        record_by_reference_mutation_in_loop(artifacts, variable, out_type);
++    }
++
+     let resolved_if_true_assertions = resolve_invocation_assertion(
+         context,
+         block_context,
+diff --git a/crates/analyzer/src/plugin/libraries/stdlib/mod.rs b/crates/analyzer/src/plugin/libraries/stdlib/mod.rs
+index ef59a2d8..d0aaa261 100644
+--- a/crates/analyzer/src/plugin/libraries/stdlib/mod.rs
++++ b/crates/analyzer/src/plugin/libraries/stdlib/mod.rs
+@@ -69,6 +69,7 @@ impl Plugin for StdlibPlugin {
+         registry.register_function_provider(pcre::PregMatchPatternProvider);
+ 
+         registry.register_function_assertion_provider(array::ArrayAllAssertionProvider);
++        registry.register_function_assertion_provider(pcre::PregMatchesAssertionProvider);
+ 
+         registry.register_function_call_hook(cookie::SetCookieHook);
+         registry.register_function_call_hook(session::SessionSetSaveHandlerHook);
+diff --git a/crates/analyzer/src/plugin/libraries/stdlib/pcre/matches.rs b/crates/analyzer/src/plugin/libraries/stdlib/pcre/matches.rs
+new file mode 100644
+index 00000000..f4ec9d0d
+--- /dev/null
++++ b/crates/analyzer/src/plugin/libraries/stdlib/pcre/matches.rs
+@@ -0,0 +1,78 @@
++//! `$matches` typing for `preg_match_all()`.
++//!
++//! When the pattern and the flags of a call are literals, the groups of the pattern
++//! decide which keys the `$matches` argument holds once the call returns. That shape
++//! replaces the declared out type, and is narrowed further wherever the call is known
++//! to have matched.
++
++use mago_codex::assertion::Assertion;
++use mago_codex::ttype::union::TUnion;
++use mago_word::word;
++
++use crate::plugin::context::InvocationInfo;
++use crate::plugin::context::ProviderContext;
++use crate::plugin::libraries::stdlib::pcre::pattern::analyze_pattern;
++use crate::plugin::libraries::stdlib::pcre::shape::MatchesTypes;
++use crate::plugin::libraries::stdlib::pcre::shape::get_matches_types;
++use crate::plugin::provider::Provider;
++use crate::plugin::provider::ProviderMeta;
++use crate::plugin::provider::assertion::FunctionAssertionProvider;
++use crate::plugin::provider::assertion::InvocationAssertions;
++use crate::plugin::provider::function::FunctionTarget;
++
++static META: ProviderMeta = ProviderMeta::new(
++    "php::pcre::matches",
++    "PCRE matches",
++    "Types the matches of preg_match_all() from the groups of a literal pattern.",
++);
++
++#[derive(Default)]
++pub struct PregMatchesAssertionProvider;
++
++impl Provider for PregMatchesAssertionProvider {
++    fn meta() -> &'static ProviderMeta {
++        &META
++    }
++}
++
++impl FunctionAssertionProvider for PregMatchesAssertionProvider {
++    fn targets() -> FunctionTarget {
++        FunctionTarget::Exact(b"preg_match_all")
++    }
++
++    fn get_assertions(
++        &self,
++        context: &ProviderContext<'_, '_, '_>,
++        invocation: &InvocationInfo<'_, '_, '_>,
++    ) -> Option<InvocationAssertions> {
++        let metadata = invocation.inner().target.get_function_like_metadata()?;
++        if !metadata.flags.is_built_in() {
++            return None;
++        }
++
++        let pattern = invocation.get_argument(0, &[b"pattern"])?;
++        let flags = invocation.get_argument(3, &[b"flags"]);
++        let types =
++            get_types(context.get_expression_type(pattern), flags.map(|flags| context.get_expression_type(flags)))?;
++
++        let mut assertions = InvocationAssertions::new();
++        assertions.add_out_type(word("$matches"), types.after_call);
++        assertions.add_if_true(word("$matches"), vec![Assertion::IsType(types.when_matched)]);
++
++        Some(assertions)
++    }
++}
++
++/// Resolves the `$matches` types of a call from the types of its pattern and flags.
++///
++/// `flags` is `None` when the argument is omitted, and holds `None` when its type is
++/// not known.
++fn get_types(pattern: Option<&TUnion>, flags: Option<Option<&TUnion>>) -> Option<MatchesTypes> {
++    let groups = analyze_pattern(pattern?.get_single_literal_string_value()?)?;
++    let flags = match flags {
++        Some(flags) => flags?.get_single_literal_int_value()?,
++        None => 0,
++    };
++
++    get_matches_types(&groups, flags)
++}
+diff --git a/crates/analyzer/src/plugin/libraries/stdlib/pcre.rs b/crates/analyzer/src/plugin/libraries/stdlib/pcre/mod.rs
+similarity index 98%
+rename from crates/analyzer/src/plugin/libraries/stdlib/pcre.rs
+rename to crates/analyzer/src/plugin/libraries/stdlib/pcre/mod.rs
+index cd21190b..2fa22208 100644
+--- a/crates/analyzer/src/plugin/libraries/stdlib/pcre.rs
++++ b/crates/analyzer/src/plugin/libraries/stdlib/pcre/mod.rs
+@@ -13,6 +13,12 @@ use crate::plugin::provider::ProviderMeta;
+ use crate::plugin::provider::function::FunctionReturnTypeProvider;
+ use crate::plugin::provider::function::FunctionTarget;
+ 
++mod matches;
++mod pattern;
++mod shape;
++
++pub use matches::PregMatchesAssertionProvider;
++
+ #[derive(Default)]
+ pub struct PregMatchPatternProvider;
+ 
+diff --git a/crates/analyzer/src/plugin/libraries/stdlib/pcre/pattern.rs b/crates/analyzer/src/plugin/libraries/stdlib/pcre/pattern.rs
+new file mode 100644
+index 00000000..83619f59
+--- /dev/null
++++ b/crates/analyzer/src/plugin/libraries/stdlib/pcre/pattern.rs
+@@ -0,0 +1,635 @@
++//! Capture group analysis for literal PCRE patterns.
++//!
++//! PHP hands the text between the delimiters to PCRE2 untouched, so the groups of a
++//! pattern can be recovered without compiling it. The scanner only understands the
++//! syntax that decides how groups are numbered and whether they take part in a match;
++//! anything it does not recognize makes the whole analysis give up.
++
++use std::collections::BTreeMap;
++
++/// A capturing group of a pattern.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct CaptureGroup {
++    pub number: usize,
++    pub name: Option<Vec<u8>>,
++    /// Whether the group takes part in every successful match.
++    pub always_matched: bool,
++    /// Whether the group can capture an empty string when it takes part in a match.
++    pub can_be_empty: bool,
++}
++
++/// The capturing structure of a pattern.
++#[derive(Debug, Clone, PartialEq, Eq)]
++pub struct PatternGroups {
++    /// Whether the whole pattern can match an empty string.
++    pub can_be_empty: bool,
++    /// Capturing groups ordered by number, starting at 1.
++    pub groups: Vec<CaptureGroup>,
++}
++
++/// Analyzes a delimited pattern, returning `None` when its groups cannot be determined.
++pub fn analyze_pattern(pattern: &[u8]) -> Option<PatternGroups> {
++    let (body, modifiers) = split_pattern(pattern)?;
++
++    let mut flags = Flags::default();
++    for modifier in modifiers {
++        match modifier {
++            b'x' => flags.extended = true,
++            b'n' => flags.no_auto_capture = true,
++            b'i' | b'm' | b's' | b'A' | b'D' | b'S' | b'U' | b'X' | b'J' | b'u' | b'r' | b' ' | b'\n' | b'\r' => {}
++            _ => return None,
++        }
++    }
++
++    let mut scanner = Scanner { bytes: body, position: 0, next_number: 1, flags };
++    let alternatives = scanner.scan_alternatives(false, true)?;
++    let root = Group { kind: GroupKind::Plain, capture: None, name: None, alternatives };
++
++    let mut table = BTreeMap::new();
++    let participation = evaluate_group(&root, &mut table)?;
++
++    let mut groups: Vec<CaptureGroup> = Vec::with_capacity(table.len());
++    for (number, entry) in table {
++        if entry.name.is_some() && groups.iter().any(|group| group.name == entry.name) {
++            return None;
++        }
++
++        let always_matched = participation.iter().any(|(candidate, always)| *candidate == number && *always);
++        groups.push(CaptureGroup { number, name: entry.name, always_matched, can_be_empty: entry.can_be_empty });
++    }
++
++    Some(PatternGroups { can_be_empty: !is_group_non_empty(&root), groups })
++}
++
++/// Splits a pattern into the text between its delimiters and its trailing modifiers.
++fn split_pattern(pattern: &[u8]) -> Option<(&[u8], &[u8])> {
++    let start = pattern.iter().position(|byte| !matches!(byte, b' ' | b'\t' | b'\n' | b'\r' | 0x0b | 0x0c))?;
++    let opening = pattern[start];
++    if !opening.is_ascii() || opening.is_ascii_alphanumeric() || matches!(opening, b'\\' | b'\0') {
++        return None;
++    }
++
++    let closing = match opening {
++        b'(' => b')',
++        b'[' => b']',
++        b'{' => b'}',
++        b'<' => b'>',
++        _ => opening,
++    };
++
++    let mut depth = 1usize;
++    let mut index = start + 1;
++    while let Some(&byte) = pattern.get(index) {
++        if byte == b'\\' {
++            index += 2;
++            continue;
++        }
++
++        if byte == closing {
++            depth -= 1;
++            if depth == 0 {
++                return Some((&pattern[start + 1..index], &pattern[index + 1..]));
++            }
++        } else if byte == opening {
++            depth += 1;
++        }
++
++        index += 1;
++    }
++
++    None
++}
++
++#[derive(Debug, Clone, Copy, Default)]
++struct Flags {
++    extended: bool,
++    no_auto_capture: bool,
++}
++
++#[derive(Debug, Clone, Copy, PartialEq, Eq)]
++enum GroupKind {
++    Plain,
++    BranchReset,
++    Lookaround { negative: bool },
++    Conditional,
++}
++
++#[derive(Debug)]
++struct Group {
++    kind: GroupKind,
++    capture: Option<usize>,
++    name: Option<Vec<u8>>,
++    alternatives: Vec<Vec<Item>>,
++}
++
++#[derive(Debug)]
++enum Node {
++    /// Anything that is not a group; the flag tells whether it consumes at least one character.
++    Atom(bool),
++    Group(Group),
++}
++
++#[derive(Debug)]
++struct Item {
++    node: Node,
++    /// Whether a quantifier lets the node repeat zero times.
++    optional: bool,
++}
++
++struct Scanner<'pattern> {
++    bytes: &'pattern [u8],
++    position: usize,
++    next_number: usize,
++    flags: Flags,
++}
++
++impl<'pattern> Scanner<'pattern> {
++    fn peek(&self) -> Option<u8> {
++        self.bytes.get(self.position).copied()
++    }
++
++    fn peek_at(&self, offset: usize) -> Option<u8> {
++        self.bytes.get(self.position + offset).copied()
++    }
++
++    /// Skips ignorable whitespace and `#` comments when the extended flag is active.
++    fn skip_ignored(&mut self) {
++        if !self.flags.extended {
++            return;
++        }
++
++        while let Some(byte) = self.peek() {
++            if byte.is_ascii_whitespace() || byte == 0x0b {
++                self.position += 1;
++            } else if byte == b'#' {
++                while self.peek().is_some_and(|byte| byte != b'\n') {
++                    self.position += 1;
++                }
++            } else {
++                break;
++            }
++        }
++    }
++
++    /// Advances past the next occurrence of `byte`, returning the text before it.
++    fn take_until(&mut self, byte: u8) -> Option<&'pattern [u8]> {
++        let length = self.bytes[self.position..].iter().position(|candidate| *candidate == byte)?;
++        let taken = &self.bytes[self.position..self.position + length];
++        self.position += length + 1;
++
++        Some(taken)
++    }
++
++    /// Scans alternatives up to the closing parenthesis of the enclosing group.
++    fn scan_alternatives(&mut self, branch_reset: bool, top_level: bool) -> Option<Vec<Vec<Item>>> {
++        let first_number = self.next_number;
++        let mut highest_number = first_number;
++        let mut alternatives = Vec::new();
++        let mut current: Vec<Item> = Vec::new();
++
++        loop {
++            self.skip_ignored();
++
++            let node = match self.peek() {
++                None if top_level => break,
++                None => return None,
++                Some(b')') if top_level => return None,
++                Some(b')') => {
++                    self.position += 1;
++                    break;
++                }
++                Some(b'|') => {
++                    self.position += 1;
++                    alternatives.push(std::mem::take(&mut current));
++                    if branch_reset {
++                        highest_number = highest_number.max(self.next_number);
++                        self.next_number = first_number;
++                    }
++
++                    continue;
++                }
++                Some(b'(') => {
++                    self.position += 1;
++                    match self.scan_group()? {
++                        Some(node) => node,
++                        None => continue,
++                    }
++                }
++                Some(b'[') => {
++                    self.position += 1;
++                    self.scan_class()?;
++                    Node::Atom(true)
++                }
++                Some(b'\\') => {
++                    self.position += 1;
++                    Node::Atom(self.scan_escape()?)
++                }
++                Some(b'^' | b'$') => {
++                    self.position += 1;
++                    Node::Atom(false)
++                }
++                Some(b'*' | b'+' | b'?') => return None,
++                Some(_) => {
++                    self.position += 1;
++                    Node::Atom(true)
++                }
++            };
++
++            self.skip_ignored();
++            let optional = self.scan_quantifier()?;
++            current.push(Item { node, optional });
++        }
++
++        alternatives.push(current);
++        if branch_reset {
++            self.next_number = highest_number.max(self.next_number);
++        }
++
++        Some(alternatives)
++    }
++
++    /// Scans a group whose opening parenthesis has been consumed.
++    ///
++    /// Returns `Some(None)` for constructs that leave nothing behind, such as comments
++    /// and option settings.
++    fn scan_group(&mut self) -> Option<Option<Node>> {
++        let outer_flags = self.flags;
++        let mut kind = GroupKind::Plain;
++        let mut capture = None;
++        let mut name = None;
++
++        match self.peek()? {
++            b'*' => {
++                self.position += 1;
++                if self.peek()?.is_ascii_lowercase() {
++                    return None;
++                }
++
++                self.take_until(b')')?;
++                return Some(Some(Node::Atom(false)));
++            }
++            b'?' => {
++                self.position += 1;
++                match self.peek()? {
++                    b'#' => {
++                        self.take_until(b')')?;
++                        return Some(None);
++                    }
++                    b':' | b'>' => self.position += 1,
++                    b'|' => {
++                        self.position += 1;
++                        kind = GroupKind::BranchReset;
++                    }
++                    b'=' | b'!' => {
++                        kind = GroupKind::Lookaround { negative: self.peek()? == b'!' };
++                        self.position += 1;
++                    }
++                    b'<' if matches!(self.peek_at(1)?, b'=' | b'!') => {
++                        kind = GroupKind::Lookaround { negative: self.peek_at(1)? == b'!' };
++                        self.position += 2;
++                    }
++                    b'<' => {
++                        self.position += 1;
++                        name = Some(self.scan_group_name(b'>')?);
++                    }
++                    b'\'' => {
++                        self.position += 1;
++                        name = Some(self.scan_group_name(b'\'')?);
++                    }
++                    b'P' if self.peek_at(1)? == b'<' => {
++                        self.position += 2;
++                        name = Some(self.scan_group_name(b'>')?);
++                    }
++                    b'P' | b'R' | b'&' | b'0'..=b'9' => {
++                        self.take_until(b')')?;
++                        return Some(Some(Node::Atom(false)));
++                    }
++                    b'+' | b'-' if self.peek_at(1)?.is_ascii_digit() => {
++                        self.take_until(b')')?;
++                        return Some(Some(Node::Atom(false)));
++                    }
++                    b'(' => {
++                        self.position += 1;
++                        kind = GroupKind::Conditional;
++                        if self.peek()? == b'?' {
++                            // The condition is an assertion; its own groups are numbered like any other.
++                            let Some(Node::Group(condition)) = self.scan_group()? else {
++                                return None;
++                            };
++
++                            if !matches!(condition.kind, GroupKind::Lookaround { .. }) {
++                                return None;
++                            }
++
++                            let alternatives = self.scan_alternatives(false, false)?;
++                            self.flags = outer_flags;
++                            let mut branches = vec![vec![Item { node: Node::Group(condition), optional: false }]];
++                            branches.extend(alternatives);
++
++                            return Some(Some(Node::Group(Group { kind, capture, name, alternatives: branches })));
++                        }
++
++                        self.take_until(b')')?;
++                    }
++                    _ => {
++                        if self.scan_options()? {
++                            return Some(None);
++                        }
++                    }
++                }
++
++                if name.is_some() {
++                    capture = Some(self.next_number);
++                    self.next_number += 1;
++                }
++            }
++            _ if self.flags.no_auto_capture => {}
++            _ => {
++                capture = Some(self.next_number);
++                self.next_number += 1;
++            }
++        }
++
++        let alternatives = self.scan_alternatives(kind == GroupKind::BranchReset, false)?;
++        self.flags = outer_flags;
++
++        Some(Some(Node::Group(Group { kind, capture, name, alternatives })))
++    }
++
++    /// Scans a group name up to its terminator.
++    fn scan_group_name(&mut self, terminator: u8) -> Option<Vec<u8>> {
++        let name = self.take_until(terminator)?;
++        let (first, rest) = name.split_first()?;
++        if !(first.is_ascii_alphabetic() || *first == b'_')
++            || !rest.iter().all(|byte| byte.is_ascii_alphanumeric() || *byte == b'_')
++            || name.len() > 32
++        {
++            return None;
++        }
++
++        Some(name.to_vec())
++    }
++
++    /// Scans inline options such as `(?i)` or `(?x-n:`.
++    ///
++    /// Returns `true` when the options apply to the rest of the enclosing group and
++    /// `false` when they open a non-capturing group of their own.
++    fn scan_options(&mut self) -> Option<bool> {
++        let mut flags = self.flags;
++        let mut enable = true;
++
++        loop {
++            let byte = self.peek()?;
++            self.position += 1;
++            match byte {
++                b')' => {
++                    self.flags = flags;
++                    return Some(true);
++                }
++                b':' => {
++                    // The caller restores the outer flags once the group closes.
++                    self.flags = flags;
++                    return Some(false);
++                }
++                b'-' => enable = false,
++                b'^' => flags = Flags::default(),
++                b'x' => flags.extended = enable,
++                b'n' => flags.no_auto_capture = enable,
++                b'i' | b'm' | b's' | b'J' | b'U' => {}
++                _ => return None,
++            }
++        }
++    }
++
++    /// Scans a character class whose opening bracket has been consumed.
++    fn scan_class(&mut self) -> Option<()> {
++        if self.peek()? == b'^' {
++            self.position += 1;
++        }
++
++        if self.peek()? == b']' {
++            self.position += 1;
++        }
++
++        loop {
++            let byte = self.peek()?;
++            self.position += 1;
++            match byte {
++                b']' => return Some(()),
++                b'\\' if self.peek()? == b'Q' => {
++                    self.position += 1;
++                    self.skip_quoted();
++                }
++                b'\\' => {
++                    self.peek()?;
++                    self.position += 1;
++                }
++                b'[' if matches!(self.peek()?, b':' | b'.' | b'=') => {
++                    let marker = self.peek()?;
++                    let rest = &self.bytes[self.position + 1..];
++                    if let Some(length) = rest.windows(2).position(|window| window == [marker, b']']) {
++                        self.position += length + 3;
++                    }
++                }
++                _ => {}
++            }
++        }
++    }
++
++    /// Skips a `\Q...\E` literal whose `\Q` has been consumed, returning its length.
++    fn skip_quoted(&mut self) -> usize {
++        let rest = &self.bytes[self.position..];
++        match rest.windows(2).position(|window| window == b"\\E") {
++            Some(length) => {
++                self.position += length + 2;
++                length
++            }
++            None => {
++                self.position = self.bytes.len();
++                rest.len()
++            }
++        }
++    }
++
++    /// Scans an escape sequence whose backslash has been consumed.
++    ///
++    /// Returns whether the sequence consumes at least one character of the subject.
++    fn scan_escape(&mut self) -> Option<bool> {
++        let byte = self.peek()?;
++        self.position += 1;
++
++        Some(match byte {
++            b'Q' => self.skip_quoted() > 0,
++            b'E' | b'b' | b'B' | b'A' | b'Z' | b'z' | b'G' | b'K' => false,
++            b'1'..=b'9' => {
++                while self.peek().is_some_and(|byte| byte.is_ascii_digit()) {
++                    self.position += 1;
++                }
++
++                false
++            }
++            b'g' | b'k' => {
++                match self.peek()? {
++                    b'{' => {
++                        self.take_until(b'}')?;
++                    }
++                    b'<' => {
++                        self.take_until(b'>')?;
++                    }
++                    b'\'' => {
++                        self.position += 1;
++                        self.take_until(b'\'')?;
++                    }
++                    _ => {
++                        while self.peek().is_some_and(|byte| byte.is_ascii_digit() || matches!(byte, b'+' | b'-')) {
++                            self.position += 1;
++                        }
++                    }
++                }
++
++                false
++            }
++            b'x' | b'p' | b'P' | b'o' | b'N' => {
++                if self.peek() == Some(b'{') {
++                    self.take_until(b'}')?;
++                } else if matches!(byte, b'p' | b'P') {
++                    self.peek()?;
++                    self.position += 1;
++                }
++
++                true
++            }
++            b'c' => {
++                self.peek()?;
++                self.position += 1;
++
++                true
++            }
++            _ => true,
++        })
++    }
++
++    /// Scans an optional quantifier, returning whether it allows zero repetitions.
++    fn scan_quantifier(&mut self) -> Option<bool> {
++        let optional = match self.peek() {
++            Some(b'*' | b'?') => {
++                self.position += 1;
++                true
++            }
++            Some(b'+') => {
++                self.position += 1;
++                false
++            }
++            Some(b'{') => {
++                let rest = &self.bytes[self.position + 1..];
++                let Some(length) = rest.iter().position(|byte| *byte == b'}') else {
++                    return Some(false);
++                };
++
++                let bounds = &rest[..length];
++                let minimum = bounds.split(|byte| *byte == b',').next().unwrap_or_default();
++                let well_formed = bounds.iter().all(|byte| byte.is_ascii_digit() || *byte == b',')
++                    && bounds.split(|byte| *byte == b',').count() <= 2
++                    && bounds.iter().any(u8::is_ascii_digit);
++
++                if !well_formed {
++                    return Some(false);
++                }
++
++                if minimum.is_empty() {
++                    // `{,n}` is a quantifier only for some PCRE2 releases.
++                    return None;
++                }
++
++                self.position += length + 2;
++                minimum.iter().all(|byte| *byte == b'0')
++            }
++            _ => return Some(false),
++        };
++
++        if matches!(self.peek(), Some(b'?' | b'+')) {
++            self.position += 1;
++        }
++
++        Some(optional)
++    }
++}
++
++struct GroupEntry {
++    name: Option<Vec<u8>>,
++    can_be_empty: bool,
++}
++
++/// Records every capturing group below `group` and returns, for each group number,
++/// whether that group takes part whenever `group` itself does.
++fn evaluate_group(group: &Group, table: &mut BTreeMap<usize, GroupEntry>) -> Option<Vec<(usize, bool)>> {
++    let mut branches = Vec::with_capacity(group.alternatives.len());
++    for alternative in &group.alternatives {
++        let mut branch: Vec<(usize, bool)> = Vec::new();
++        for item in alternative {
++            let Node::Group(inner) = &item.node else {
++                continue;
++            };
++
++            let mut participation = evaluate_group(inner, table)?;
++            if item.optional {
++                for (_, always) in &mut participation {
++                    *always = false;
++                }
++            }
++
++            branch.extend(participation);
++        }
++
++        branches.push(branch);
++    }
++
++    let mut participation: Vec<(usize, bool)> = Vec::new();
++    for branch in &branches {
++        for (number, always) in branch {
++            let shared = match group.kind {
++                GroupKind::Plain => branches.len() == 1 && *always,
++                GroupKind::BranchReset => branches.iter().all(|other| other.contains(&(*number, true))),
++                GroupKind::Lookaround { negative } => !negative && branches.len() == 1 && *always,
++                GroupKind::Conditional => false,
++            };
++
++            match participation.iter_mut().find(|(candidate, _)| candidate == number) {
++                Some(existing) => existing.1 = existing.1 && shared,
++                None => participation.push((*number, shared)),
++            }
++        }
++    }
++
++    if let Some(number) = group.capture {
++        let can_be_empty = !is_group_non_empty(group);
++        match table.get_mut(&number) {
++            Some(entry) if entry.name != group.name => return None,
++            Some(entry) => entry.can_be_empty = entry.can_be_empty || can_be_empty,
++            None => {
++                table.insert(number, GroupEntry { name: group.name.clone(), can_be_empty });
++            }
++        }
++
++        participation.push((number, true));
++    }
++
++    Some(participation)
++}
++
++/// Whether every way of matching the group consumes at least one character.
++fn is_group_non_empty(group: &Group) -> bool {
++    if group.kind != GroupKind::Plain && group.kind != GroupKind::BranchReset {
++        return false;
++    }
++
++    group.alternatives.iter().all(|alternative| {
++        alternative.iter().any(|item| {
++            !item.optional
++                && match &item.node {
++                    Node::Atom(non_empty) => *non_empty,
++                    Node::Group(inner) => is_group_non_empty(inner),
++                }
++        })
++    })
++}
+diff --git a/crates/analyzer/src/plugin/libraries/stdlib/pcre/shape.rs b/crates/analyzer/src/plugin/libraries/stdlib/pcre/shape.rs
+new file mode 100644
+index 00000000..a2146b53
+--- /dev/null
++++ b/crates/analyzer/src/plugin/libraries/stdlib/pcre/shape.rs
+@@ -0,0 +1,148 @@
++//! Array shapes written to the `$matches` argument of `preg_match_all()`.
++
++use std::collections::BTreeMap;
++use std::sync::Arc;
++
++use mago_codex::ttype::atomic::TAtomic;
++use mago_codex::ttype::atomic::array::TArray;
++use mago_codex::ttype::atomic::array::key::ArrayKey;
++use mago_codex::ttype::atomic::array::keyed::TKeyedArray;
++use mago_codex::ttype::atomic::array::list::TList;
++use mago_codex::ttype::get_int;
++use mago_codex::ttype::get_non_empty_string;
++use mago_codex::ttype::get_string;
++use mago_codex::ttype::union::TUnion;
++use mago_word::word;
++
++use crate::plugin::libraries::stdlib::pcre::pattern::PatternGroups;
++
++const PREG_PATTERN_ORDER: i64 = 1;
++const PREG_SET_ORDER: i64 = 2;
++const PREG_OFFSET_CAPTURE: i64 = 256;
++const PREG_UNMATCHED_AS_NULL: i64 = 512;
++
++/// The types `$matches` can hold once `preg_match_all()` has returned.
++#[derive(Debug, Clone)]
++pub struct MatchesTypes {
++    /// The type right after the call, whatever it returned.
++    pub after_call: TUnion,
++    /// The type when the call found at least one match.
++    pub when_matched: TAtomic,
++}
++
++#[derive(Debug, Clone, Copy)]
++struct MatchFlags {
++    set_order: bool,
++    offset_capture: bool,
++    unmatched_as_null: bool,
++}
++
++impl MatchFlags {
++    fn from_bits(bits: i64) -> Option<Self> {
++        let ordering = PREG_PATTERN_ORDER | PREG_SET_ORDER;
++        let accepted = ordering | PREG_OFFSET_CAPTURE | PREG_UNMATCHED_AS_NULL;
++        if bits & !accepted != 0 || bits & ordering == ordering {
++            return None;
++        }
++
++        Some(Self {
++            set_order: bits & PREG_SET_ORDER != 0,
++            offset_capture: bits & PREG_OFFSET_CAPTURE != 0,
++            unmatched_as_null: bits & PREG_UNMATCHED_AS_NULL != 0,
++        })
++    }
++}
++
++/// Builds the `$matches` types for a call, or `None` when the flags cannot be honored.
++pub fn get_matches_types(groups: &PatternGroups, flags: i64) -> Option<MatchesTypes> {
++    let flags = MatchFlags::from_bits(flags)?;
++    if !flags.set_order {
++        return Some(MatchesTypes {
++            after_call: TUnion::from_atomic(TAtomic::Array(TArray::Keyed(get_pattern_order_shape(
++                groups, flags, false,
++            )))),
++            when_matched: TAtomic::Array(TArray::Keyed(get_pattern_order_shape(groups, flags, true))),
++        });
++    }
++
++    let element = Arc::new(TUnion::from_atomic(TAtomic::Array(TArray::Keyed(get_single_match_shape(groups, flags)))));
++
++    Some(MatchesTypes {
++        after_call: TUnion::from_atomic(TAtomic::Array(TArray::List(TList::new(Arc::clone(&element))))),
++        when_matched: TAtomic::Array(TArray::List(TList::new_non_empty(element))),
++    })
++}
++
++/// The array describing one match in set order: the whole match under `0`, then every group under
++/// its name, if it has one, and its number.
++///
++/// Without `PREG_UNMATCHED_AS_NULL`, PHP drops the groups that follow the last group
++/// taking part in the match, so a key is only guaranteed when it, or a later group,
++/// always takes part.
++fn get_single_match_shape(groups: &PatternGroups, flags: MatchFlags) -> TKeyedArray {
++    let mut items = BTreeMap::new();
++    items.insert(ArrayKey::Integer(0), (false, get_capture_type(!groups.can_be_empty, false, flags)));
++
++    for (index, group) in groups.groups.iter().enumerate() {
++        let optional =
++            !flags.unmatched_as_null && !groups.groups[index..].iter().any(|following| following.always_matched);
++        let capture_type = get_capture_type(!group.can_be_empty, !group.always_matched, flags);
++
++        if let Some(name) = &group.name {
++            items.insert(ArrayKey::String(word(name)), (optional, capture_type.clone()));
++        }
++
++        items.insert(ArrayKey::Integer(group.number as i64), (optional, capture_type));
++    }
++
++    TKeyedArray::new().with_known_items(items).with_non_empty(true)
++}
++
++/// The array filled in pattern order: one list per group, each
++/// holding that group's capture for every match.
++fn get_pattern_order_shape(groups: &PatternGroups, flags: MatchFlags, matched: bool) -> TKeyedArray {
++    let get_captures = |capture_type: TUnion| {
++        let element = Arc::new(capture_type);
++        let list = if matched { TList::new_non_empty(element) } else { TList::new(element) };
++
++        TUnion::from_atomic(TAtomic::Array(TArray::List(list)))
++    };
++
++    let mut items = BTreeMap::new();
++    items.insert(ArrayKey::Integer(0), (false, get_captures(get_capture_type(!groups.can_be_empty, false, flags))));
++
++    for group in &groups.groups {
++        let captures = get_captures(get_capture_type(!group.can_be_empty, !group.always_matched, flags));
++        if let Some(name) = &group.name {
++            items.insert(ArrayKey::String(word(name)), (false, captures.clone()));
++        }
++
++        items.insert(ArrayKey::Integer(group.number as i64), (false, captures));
++    }
++
++    TKeyedArray::new().with_known_items(items).with_non_empty(true)
++}
++
++/// The type of a single capture.
++///
++/// A group that did not take part in the match is reported as an empty string, or as
++/// `null` under `PREG_UNMATCHED_AS_NULL`. `PREG_OFFSET_CAPTURE` pairs every capture
++/// with its offset in the subject.
++fn get_capture_type(non_empty: bool, may_be_unmatched: bool, flags: MatchFlags) -> TUnion {
++    let mut capture_type =
++        if non_empty && (!may_be_unmatched || flags.unmatched_as_null) { get_non_empty_string() } else { get_string() };
++
++    if may_be_unmatched && flags.unmatched_as_null {
++        let mut atomics = capture_type.types.into_owned();
++        atomics.push(TAtomic::Null);
++        capture_type = TUnion::from_vec(atomics);
++    }
++
++    if !flags.offset_capture {
++        return capture_type;
++    }
++
++    let pair = TList::from_known_elements(BTreeMap::from([(0, (false, capture_type)), (1, (false, get_int()))]));
++
++    TUnion::from_atomic(TAtomic::Array(TArray::List(pair)))
++}
+diff --git a/crates/analyzer/src/plugin/provider/assertion.rs b/crates/analyzer/src/plugin/provider/assertion.rs
+index 119b8b9a..f24f93b1 100644
+--- a/crates/analyzer/src/plugin/provider/assertion.rs
++++ b/crates/analyzer/src/plugin/provider/assertion.rs
+@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
+ 
+ use mago_algebra::assertion_set::Conjunction;
+ use mago_codex::assertion::Assertion;
++use mago_codex::ttype::union::TUnion;
+ use mago_word::Word;
+ 
+ use crate::plugin::context::InvocationInfo;
+@@ -21,6 +22,9 @@ use crate::plugin::provider::method::MethodTarget;
+ /// - `immediate`: assertions that apply unconditionally after the call
+ /// - `if_true`: assertions that hold when the call returns truthy
+ /// - `if_false`: assertions that hold when the call returns falsy
++///
++/// It can also carry the types the invocation writes to its by-reference arguments,
++/// which replace the declared out types before any assertion is resolved.
+ #[derive(Debug, Clone, Default)]
+ pub struct InvocationAssertions {
+     /// Assertions that apply unconditionally after the invocation.
+@@ -37,6 +41,12 @@ pub struct InvocationAssertions {
+     ///
+     /// Keys are variable names (e.g., "$x"), values are assertion sets.
+     pub if_false: BTreeMap<Word, Conjunction<Assertion>>,
++
++    /// Types written to by-reference arguments by the invocation.
++    ///
++    /// Keys are parameter names (e.g., "$matches"), values are the types the
++    /// corresponding arguments hold once the invocation returns.
++    pub out_types: BTreeMap<Word, TUnion>,
+ }
+ 
+ impl InvocationAssertions {
+@@ -53,7 +63,10 @@ impl InvocationAssertions {
+     #[inline]
+     #[must_use]
+     pub fn is_empty(&self) -> bool {
+-        self.type_assertions.is_empty() && self.if_true.is_empty() && self.if_false.is_empty()
++        self.type_assertions.is_empty()
++            && self.if_true.is_empty()
++            && self.if_false.is_empty()
++            && self.out_types.is_empty()
+     }
+ 
+     /// Add an immediate assertion for a variable.
+@@ -70,6 +83,11 @@ impl InvocationAssertions {
+     pub fn add_if_false(&mut self, variable: Word, assertions: Conjunction<Assertion>) {
+         self.if_false.insert(variable, assertions);
+     }
++
++    /// Set the type a by-reference argument holds once the invocation returns.
++    pub fn add_out_type(&mut self, parameter: Word, out_type: TUnion) {
++        self.out_types.insert(parameter, out_type);
++    }
+ }
+ 
+ /// Provider for getting additional assertions from function calls.
